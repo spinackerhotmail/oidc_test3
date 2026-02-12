@@ -4,10 +4,13 @@ namespace OIDC_test3.Services;
 
 public interface ISessionService
 {
-    Task<UserSession> CreateSessionAsync(AppUser user, string accessToken, string refreshToken,
-        string idToken, int expiresIn, int refreshExpiresIn, string? sessionState);
+    Task<UserSession> CreateSessionAsync(AppUser user, string authProvider,
+        string accessToken, string refreshToken,
+        DateTime accessTokenExpiresAt, DateTime refreshTokenExpiresAt,
+        string? providerAccessToken = null, string? providerRefreshToken = null,
+        string? providerIdToken = null, string? sessionState = null);
 
-    Task<UserSession?> GetActiveSessionAsync(Guid sessionId);
+    Task<UserSession?> GetActiveSessionByRefreshTokenAsync(string refreshToken);
     Task InvalidateSessionAsync(Guid sessionId);
     Task InvalidateAllUserSessionsAsync(Guid userId);
 }

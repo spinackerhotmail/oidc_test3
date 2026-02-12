@@ -14,7 +14,7 @@ public class UserService : IUserService
     }
 
     public async Task<AppUser> GetOrCreateUserAsync(string sub, string? userName, string? email,
-        string? givenName, string? familyName, string? middleName)
+        string? givenName, string? familyName, string? middleName, string authProvider)
     {
         var user = await _db.Users.FirstOrDefaultAsync(u => u.Sub == sub);
         if (user is null)
@@ -28,6 +28,7 @@ public class UserService : IUserService
                 GivenName = givenName,
                 FamilyName = familyName,
                 MiddleName = middleName,
+                AuthProvider = authProvider,
                 CreatedAt = DateTime.UtcNow,
                 LastLoginAt = DateTime.UtcNow
             };
@@ -45,5 +46,37 @@ public class UserService : IUserService
 
         await _db.SaveChangesAsync();
         return user;
+    }
+
+    public async Task<AppUser> CreateLocalUserAsync(string userName, string passwordHash,
+        string? email, string? givenName, string? familyName, string? middleName)
+    {
+        var user = new AppUser
+        {
+            Id = Guid.NewGuid(),
+            Sub = $"local:{Guid.NewGuid()}",
+            UserName = userName,
+            PasswordHash = passwordHash,
+            Email = email,
+            GivenName = givenName,
+            FamilyName = familyName,
+            MiddleName = middleName,
+            AuthProvider = "local",
+            CreatedAt = DateTime.UtcNow,
+        };
+
+        _db.Users.Add(user);
+        await _db.SaveChangesAsync();
+        return user;
+    }
+
+    public async Task<AppUser?> FindByUserNameAsync(string userName)
+    {
+        return await _db.Users.FirstOrDefaultAsync(u => u.UserName == userName);
+    }
+
+    public async Task<AppUser?> FindByIdAsync(Guid id)
+    {
+        return await _db.Users.FindAsync(id);
     }
 }

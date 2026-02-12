@@ -172,17 +172,11 @@ Content-Type: application/json
 
 ### Сценарий 5 -- Выход пользователя (Single Logout)
 
-#### Вариант A -- API-вызов (из бэкенда)
-
 Инвалидирует все сессии пользователя и уведомляет ИА ЕГИСЗ.
 
 ```http
 POST /api/auth/logout
-Content-Type: application/json
-
-{
-  "sessionId": "f47ac10b-58cc-4372-a567-0e02b2c3d479"
-}
+Cookie: refresh_token=<value>
 ```
 
 **Ответ (200 OK):**
@@ -193,18 +187,8 @@ Content-Type: application/json
 }
 ```
 
-#### Вариант B -- Redirect (из браузера)
-
-Перенаправляет пользователя на IA ЕГИСЗ для завершения глобальной сессии:
-
-```
-GET /api/auth/logout/{sessionId}
-```
-
-Браузер будет перенаправлен на ИА ЕГИСЗ logout, затем обратно на сервис авторизации.
-
-> **Single Logout:** при выходе из одного внешнего сервиса инвалидируются **все** сессии
-> данного пользователя -- во всех подключённых сервисах.
+> **Single Logout:** при выходе инвалидируются **все** сессии данного пользователя.
+> Если пользователь авторизован через ЕГИСЗ, уведомление о logout отправляется в ИА ЕГИСЗ.
 
 ---
 
@@ -212,13 +196,14 @@ GET /api/auth/logout/{sessionId}
 
 | Метод  | Эндпоинт                       | Описание                                       |
 |--------|--------------------------------|-------------------------------------------------|
-| `GET`  | `/api/auth/login`              | Начать авторизацию (redirect на ИА ЕГИСЗ)       |
-| `GET`  | `/api/auth/callback`           | OIDC callback (вызывается автоматически)        |
-| `GET`  | `/api/auth/session/{id}`       | Проверить сессию, получить данные пользователя   |
-| `GET`  | `/api/auth/userinfo/{id}`      | Данные пользователя из ИА ЕГИСЗ                 |
-| `POST` | `/api/auth/refresh`            | Обновить токены                                 |
-| `POST` | `/api/auth/logout`             | Выход (API, Single Logout)                      |
-| `GET`  | `/api/auth/logout/{id}`        | Выход (browser redirect, Single Logout)         |
+| `GET`  | `/api/auth/providers`          | Список доступных провайдеров                    |
+| `POST` | `/api/auth/register`           | Регистрация локального пользователя             |
+| `POST` | `/api/auth/login/local`        | Логин через логин/пароль                        |
+| `GET`  | `/api/auth/login/egisz`        | Начать OIDC-авторизацию (redirect)              |
+| `GET`  | `/api/auth/callback/egisz`     | OIDC callback (вызывается автоматически)        |
+| `POST` | `/api/auth/refresh`            | Обновить токены (из cookie `refresh_token`)     |
+| `GET`  | `/api/auth/me`                 | Данные текущего пользователя (требует Bearer)   |
+| `POST` | `/api/auth/logout`             | Выход (из cookie `refresh_token`)               |
 
 ---
 
@@ -241,42 +226,41 @@ public class AuthServiceClient
     // Получить URL для редиректа пользователя на логин
     public string GetLoginUrl(string returnUrl)
     {
-        return $"{_authBaseUrl}/api/auth/login?returnUrl={Uri.EscapeDataString(returnUrl)}";
+        return $"{_authBaseUrl}/api/auth/login/egisz?returnUrl={Uri.EscapeDataString(returnUrl)}";
     }
 
-    // Проверить сессию
-    public async Task<SessionInfo?> GetSessionAsync(Guid sessionId)
+    // Обновить токен (refresh_token читается из cookie)
+    public async Task<RefreshResult?> RefreshAsync()
     {
-        var response = await _http.GetAsync($"{_authBaseUrl}/api/auth/session/{sessionId}");
-        if (!response.IsSuccessStatusCode)
-            return null;
-        return await response.Content.ReadFromJsonAsync<SessionInfo>();
-    }
-
-    // Обновить токен
-    public async Task<RefreshResult?> RefreshAsync(Guid sessionId)
-    {
-        var response = await _http.PostAsJsonAsync(
-            $"{_authBaseUrl}/api/auth/refresh",
-            new { sessionId });
+        var response = await _http.PostAsync(
+            $"{_authBaseUrl}/api/auth/refresh", null);
         if (!response.IsSuccessStatusCode)
             return null;
         return await response.Content.ReadFromJsonAsync<RefreshResult>();
     }
 
-    // Выход
-    public async Task LogoutAsync(Guid sessionId)
+    // Выход (refresh_token читается из cookie)
+    public async Task LogoutAsync()
     {
-        await _http.PostAsJsonAsync(
-            $"{_authBaseUrl}/api/auth/logout",
-            new { sessionId });
+        await _http.PostAsync(
+            $"{_authBaseUrl}/api/auth/logout", null);
+    }
+
+    // Получить данные текущего пользователя (требует Bearer token)
+    public async Task<UserInfo?> GetCurrentUserAsync(string accessToken)
+    {
+        _http.DefaultRequestHeaders.Authorization =
+            new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", accessToken);
+        var response = await _http.GetAsync($"{_authBaseUrl}/api/auth/me");
+        if (!response.IsSuccessStatusCode)
+            return null;
+        return await response.Content.ReadFromJsonAsync<UserInfo>();
     }
 }
 
-public record SessionInfo(Guid SessionId, bool IsActive, DateTime? AccessTokenExpiresAt, UserInfo User);
 public record UserInfo(string Sub, string? UserName, string? Email,
-    string? GivenName, string? FamilyName, string? MiddleName);
-public record RefreshResult(string AccessToken, int ExpiresIn, string RefreshToken, string IdToken);
+    string? GivenName, string? FamilyName, string? MiddleName, string? AuthProvider);
+public record RefreshResult(string AccessToken, int ExpiresIn);
 ```
 
 ### JavaScript (fetch)
@@ -284,36 +268,36 @@ public record RefreshResult(string AccessToken, int ExpiresIn, string RefreshTok
 ```javascript
 const AUTH_BASE = 'https://auth-service.example.com';
 
-// Перенаправить на логин
+// Перенаправить на логин ЕГИСЗ
 function login(returnUrl) {
   window.location.href =
-    `${AUTH_BASE}/api/auth/login?returnUrl=${encodeURIComponent(returnUrl)}`;
+    `${AUTH_BASE}/api/auth/login/egisz?returnUrl=${encodeURIComponent(returnUrl)}`;
 }
 
-// Проверить сессию
-async function getSession(sessionId) {
-  const res = await fetch(`${AUTH_BASE}/api/auth/session/${sessionId}`);
-  if (!res.ok) return null;
-  return await res.json();
-}
-
-// Обновить токен
-async function refresh(sessionId) {
-  const res = await fetch(`${AUTH_BASE}/api/auth/refresh`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ sessionId })
+// Получить данные текущего пользователя
+async function getCurrentUser(accessToken) {
+  const res = await fetch(`${AUTH_BASE}/api/auth/me`, {
+    headers: { 'Authorization': `Bearer ${accessToken}` }
   });
   if (!res.ok) return null;
   return await res.json();
 }
 
-// Выход
-async function logout(sessionId) {
+// Обновить токен (refresh_token читается из cookie автоматически)
+async function refresh() {
+  const res = await fetch(`${AUTH_BASE}/api/auth/refresh`, {
+    method: 'POST',
+    credentials: 'include' // важно для отправки cookie
+  });
+  if (!res.ok) return null;
+  return await res.json();
+}
+
+// Выход (refresh_token читается из cookie автоматически)
+async function logout() {
   await fetch(`${AUTH_BASE}/api/auth/logout`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ sessionId })
+    credentials: 'include' // важно для отправки cookie
   });
 }
 ```

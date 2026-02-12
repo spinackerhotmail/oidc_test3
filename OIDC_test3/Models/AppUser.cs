@@ -5,7 +5,7 @@ public class AppUser
     public Guid Id { get; set; }
 
     /// <summary>
-    /// Subject identifier from IA EGISZ (OIDC "sub" claim).
+    /// Subject identifier. For EGISZ users -- OIDC "sub" claim. For local users -- generated GUID string.
     /// </summary>
     public string Sub { get; set; } = null!;
 
@@ -15,8 +15,16 @@ public class AppUser
     public string? FamilyName { get; set; }
     public string? MiddleName { get; set; }
 
+    /// <summary>
+    /// BCrypt password hash. Only set for local auth provider users.
+    /// </summary>
+    public string? PasswordHash { get; set; }
+
+    /// <summary>
+    /// Authentication provider that created this user: "local", "egisz".
+    /// </summary>
+    public string AuthProvider { get; set; } = "local";
+
     public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
     public DateTime? LastLoginAt { get; set; }
-
-    public ICollection<UserSession> Sessions { get; set; } = [];
 }
