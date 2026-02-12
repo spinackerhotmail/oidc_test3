@@ -1,12 +1,5 @@
 # Redis для сессий пользователей
 
-## Почему Redis?
-
-? **Скорость** — In-memory операции быстрее PostgreSQL на порядок  
-? **TTL** — Автоматическое удаление истёкших сессий (не нужна очистка)  
-? **Масштабирование** — Легко добавить Redis Cluster при росте нагрузки  
-? **Меньше нагрузки на PostgreSQL** — БД используется только для Users
-
 ## Структура данных в Redis
 
 ### Ключи
@@ -99,28 +92,3 @@ TTL session:refresh:abc123...
 ```bash
 docker exec -it egisz-auth-redis redis-cli FLUSHDB
 ```
-
-## Миграция с PostgreSQL
-
-Если у вас уже были сессии в PostgreSQL:
-
-1. **Применить миграцию** (удалить таблицу `user_sessions`):
-   ```bash
-   cd OIDC_test3
-   dotnet ef migrations add RemoveUserSessionsTable
-   dotnet ef database update
-   ```
-
-2. **Перезапустить сервис** — все новые сессии создаются в Redis
-
-3. **Старые сессии** в PostgreSQL автоматически станут невалидными (refresh вернёт 401)
-
-## Производительность
-
-| Операция | PostgreSQL | Redis | Ускорение |
-|----------|------------|-------|-----------|
-| `CreateSession` | ~5-10ms | ~1ms | **5-10x** |
-| `GetSessionByRefreshToken` | ~3-7ms | ~0.5ms | **6-14x** |
-| `InvalidateSession` | ~5ms | ~0.5ms | **10x** |
-
-В production с высокой нагрузкой разница может достигать **100x**.

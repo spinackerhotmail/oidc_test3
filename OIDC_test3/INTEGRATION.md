@@ -3,7 +3,7 @@
 ## Обзор
 
 Сервис авторизации ЕГИСЗ предоставляет единую точку аутентификации пользователей
-через ИА ЕГИСЗ (OpenID Connect) для всех подключённых внешних сервисов.
+через ИА ЕГИСЗ (OpenID Connect) или локальный логин/пароль для всех подключённых внешних сервисов.
 
 Внешний сервис **не взаимодействует напрямую с ИА ЕГИСЗ** -- вместо этого
 он работает через API данного сервиса авторизации.
@@ -13,6 +13,10 @@
 |  Внешний сервис   | --> |  Сервис авторизации ЕГИСЗ  | --> |  ИА ЕГИСЗ     |
 |  (ваш backend)   | <-- |  (этот API)                | <-- |  (OIDC IdP)   |
 +------------------+     +----------------------------+     +---------------+
+                              |                                      
+                              v                                      
+                         Redis (сессии)
+                         PostgreSQL (users)
 ```
 
 ## Базовый URL
@@ -21,20 +25,35 @@
 https://<auth-service-host>
 ```
 
-## Сценарии интеграции
+## Архитектура безопасности
+
+### Два типа токенов
+
+| Токен | Где хранится | Срок жизни | Назначение |
+|-------|--------------|------------|------------|
+| **Access Token** (JWT) | Тело ответа → localStorage/память клиента | 30 мин (по умолчанию) | Авторизация API-запросов (Bearer) |
+| **Refresh Token** | HttpOnly Cookie (недоступен из JS) | 24 часа (по умолчанию) | Обновление access token |
+
+### Почему HttpOnly Cookie?
+
+✅ **Защита от XSS** — JavaScript не может прочитать refresh token  
+✅ **Автоматическая отправка** — браузер сам отправляет cookie при запросах к `/api/auth/*`  
+✅ **Безопасность** — украденный access token действует только 30 мин
 
 ---
 
-### Сценарий 1 -- Аутентификация пользователя (Authorization Code Flow)
+## Сценарии интеграции
 
-Используется когда внешнему сервису нужно идентифицировать пользователя.
+### Сценарий 1 -- Аутентификация пользователя через ЕГИСЗ (OIDC)
+
+Используется когда внешнему сервису нужно идентифицировать пользователя через ИА ЕГИСЗ.
 
 #### Шаг 1. Перенаправить пользователя на логин
 
-Из фронтенда или бэкенда перенаправьте пользователя на:
+Из фронтенда перенаправьте пользователя на:
 
 ```
-GET /api/auth/login?returnUrl=https://your-service.example.com/after-login
+GET /api/auth/login/egisz?returnUrl=https://your-service.example.com/after-login
 ```
 
 | Параметр    | Обязателен | Описание                                                   |
@@ -45,85 +64,136 @@ GET /api/auth/login?returnUrl=https://your-service.example.com/after-login
 
 #### Шаг 2. Получить результат из callback
 
-После успешной аутентификации сервис вернёт JSON-ответ:
-
-```http
-GET /api/auth/callback?code=...&state=...
-```
+После успешной аутентификации сервис вернёт JSON-ответ в браузер:
 
 **Ответ (200 OK):**
 
 ```json
 {
-  "sessionId": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
-  "accessToken": "eyJhbGciOiJSUzI1NiJ9...",
-  "expiresIn": 300,
-  "refreshToken": "eyJhbGciOiJSUzI1NiJ9...",
-  "idToken": "eyJhbGciOiJSUzI1NiJ9...",
+  "accessToken": "eyJhbGciOiJIUzI1NiJ9...",
+  "expiresIn": 1800,
   "user": {
     "sub": "acd969f9-7fe1-4230-b572-aa2c0d9b7009",
     "userName": "ivanov",
     "email": "ivanov@example.com",
     "givenName": "Иван",
     "familyName": "Иванов",
-    "middleName": "Петрович"
-  }
+    "middleName": "Петрович",
+    "authProvider": "egisz"
+  },
+  "authProvider": "egisz"
 }
 ```
 
-> **Важно:** Сохраните `sessionId` -- это ключ для всех дальнейших операций.
+**Одновременно устанавливается cookie:**
 
-#### Шаг 3. Сохранить sessionId
+```
+Set-Cookie: refresh_token=<value>; HttpOnly; Secure; SameSite=Strict; Path=/api/auth; Max-Age=86400
+```
 
-Сохраните `sessionId` на стороне внешнего сервиса (в cookie, в сессии, в localStorage фронтенда)
-и используйте его для проверки авторизации и получения данных пользователя.
+#### Шаг 3. Сохранить accessToken на фронтенде
+
+Ваш фронтенд должен:
+
+1. **Извлечь `accessToken`** из JSON-ответа
+2. **Сохранить** в памяти или `sessionStorage` (не в `localStorage` для безопасности)
+3. **Использовать** для всех API-запросов в заголовке `Authorization: Bearer <accessToken>`
+
+**Пример (JavaScript):**
+
+```javascript
+// После redirect на /callback/egisz браузер отображает JSON
+const response = await fetch(window.location.href);
+const data = await response.json();
+
+// Сохранить accessToken
+sessionStorage.setItem('accessToken', data.accessToken);
+sessionStorage.setItem('user', JSON.stringify(data.user));
+
+// Перенаправить на главную страницу вашего приложения
+window.location.href = '/dashboard';
+```
 
 ---
 
-### Сценарий 2 -- Проверка авторизации пользователя
+### Сценарий 2 -- Локальная аутентификация (логин/пароль)
 
-Перед выполнением защищённого действия внешний сервис проверяет, активна ли сессия.
+Для тестирования или внутренних пользователей без доступа к ИА ЕГИСЗ.
+
+#### Шаг 1. Зарегистрировать пользователя
 
 ```http
-GET /api/auth/session/{sessionId}
+POST /api/auth/register
+Content-Type: application/json
+
+{
+  "username": "testuser",
+  "password": "MyPassword123",
+  "email": "test@example.com",
+  "givenName": "Тест",
+  "familyName": "Тестов",
+  "middleName": "Тестович"
+}
 ```
 
 **Ответ (200 OK):**
 
 ```json
 {
-  "sessionId": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
-  "isActive": true,
-  "accessTokenExpiresAt": "2025-02-12T10:30:00Z",
-  "user": {
-    "sub": "acd969f9-7fe1-4230-b572-aa2c0d9b7009",
-    "userName": "ivanov",
-    "email": "ivanov@example.com",
-    "givenName": "Иван",
-    "familyName": "Иванов",
-    "middleName": "Петрович"
-  }
+  "sub": "local:550e8400-e29b-41d4-a716-446655440000",
+  "userName": "testuser",
+  "email": "test@example.com",
+  "givenName": "Тест",
+  "familyName": "Тестов",
+  "middleName": "Тестович",
+  "authProvider": "local"
 }
 ```
 
-**Ответ (404 Not Found):**
+#### Шаг 2. Выполнить логин
+
+```http
+POST /api/auth/login/local
+Content-Type: application/json
+
+{
+  "username": "testuser",
+  "password": "MyPassword123"
+}
+```
+
+**Ответ (200 OK):**
 
 ```json
 {
-  "error": "Session not found or inactive."
+  "accessToken": "eyJhbGciOiJIUzI1NiJ9...",
+  "expiresIn": 1800,
+  "user": {
+    "sub": "local:550e8400-...",
+    "userName": "testuser",
+    "email": "test@example.com",
+    "givenName": "Тест",
+    "familyName": "Тестов",
+    "middleName": "Тестович",
+    "authProvider": "local"
+  },
+  "authProvider": "local"
 }
 ```
 
-> Если сессия не найдена или неактивна -- перенаправьте пользователя на `/api/auth/login`.
++ Cookie `refresh_token` (HttpOnly)
 
 ---
 
-### Сценарий 3 -- Получение данных пользователя из ИА ЕГИСЗ
+### Сценарий 3 -- Использование защищённых эндпоинтов
 
-Если нужны актуальные данные из ИА ЕГИСЗ (а не из локальной БД):
+Все запросы к защищённым эндпоинтам требуют `Authorization: Bearer <accessToken>`.
+
+#### Пример: Получить данные текущего пользователя
 
 ```http
-GET /api/auth/userinfo/{sessionId}
+GET /api/auth/me
+Authorization: Bearer eyJhbGciOiJIUzI1NiJ9...
 ```
 
 **Ответ (200 OK):**
@@ -135,44 +205,55 @@ GET /api/auth/userinfo/{sessionId}
   "email": "ivanov@example.com",
   "givenName": "Иван",
   "familyName": "Иванов",
-  "middleName": "Петрович"
+  "middleName": "Петрович",
+  "authProvider": "egisz"
+}
+```
+
+**Ответ (401 Unauthorized):** Если токен истёк или невалиден
+
+```json
+{
+  "error": "Unauthorized"
 }
 ```
 
 ---
 
-### Сценарий 4 -- Обновление токена
+### Сценарий 4 -- Обновление токена (Refresh)
 
-Когда `accessTokenExpiresAt` приближается или уже прошёл, обновите токен:
+Когда `accessToken` истекает (через 30 минут), обновите его:
 
 ```http
 POST /api/auth/refresh
-Content-Type: application/json
-
-{
-  "sessionId": "f47ac10b-58cc-4372-a567-0e02b2c3d479"
-}
+Cookie: refresh_token=<value>
 ```
+
+> **Важно:** `refresh_token` отправляется автоматически браузером из HttpOnly cookie.
+> Тело запроса пустое.
 
 **Ответ (200 OK):**
 
 ```json
 {
-  "accessToken": "eyJhbGciOiJSUzI1NiJ9...",
-  "expiresIn": 300,
-  "refreshToken": "eyJhbGciOiJSUzI1NiJ9...",
-  "idToken": "eyJhbGciOiJSUzI1NiJ9..."
+  "accessToken": "eyJhbGciOiJIUzI1NiJ9...",
+  "expiresIn": 1800
 }
 ```
 
-> **Внимание:** После refresh старая сессия инвалидируется. Новый `sessionId` нужно
-> получить повторным вызовом `/api/auth/session/{sessionId}` или из следующего login.
+**Ответ (401 Unauthorized):** Если refresh token истёк или невалиден
+
+```json
+{
+  "error": "Invalid or expired refresh token."
+}
+```
+
+> После успешного refresh **старая сессия инвалидируется**, выдаётся новый `refresh_token` (cookie обновляется автоматически).
 
 ---
 
-### Сценарий 5 -- Выход пользователя (Single Logout)
-
-Инвалидирует все сессии пользователя и уведомляет ИА ЕГИСЗ.
+### Сценарий 5 -- Выход пользователя (Logout)
 
 ```http
 POST /api/auth/logout
@@ -187,131 +268,225 @@ Cookie: refresh_token=<value>
 }
 ```
 
-> **Single Logout:** при выходе инвалидируются **все** сессии данного пользователя.
-> Если пользователь авторизован через ЕГИСЗ, уведомление о logout отправляется в ИА ЕГИСЗ.
+**Что происходит:**
+
+1. Все сессии пользователя инвалидируются (logout everywhere)
+2. Cookie `refresh_token` удаляется
+3. Если пользователь авторизован через ЕГИСЗ, отправляется запрос Single Logout в ИА ЕГИСЗ
 
 ---
 
 ## Справочник API
 
-| Метод  | Эндпоинт                       | Описание                                       |
-|--------|--------------------------------|-------------------------------------------------|
-| `GET`  | `/api/auth/providers`          | Список доступных провайдеров                    |
-| `POST` | `/api/auth/register`           | Регистрация локального пользователя             |
-| `POST` | `/api/auth/login/local`        | Логин через логин/пароль                        |
-| `GET`  | `/api/auth/login/egisz`        | Начать OIDC-авторизацию (redirect)              |
-| `GET`  | `/api/auth/callback/egisz`     | OIDC callback (вызывается автоматически)        |
-| `POST` | `/api/auth/refresh`            | Обновить токены (из cookie `refresh_token`)     |
-| `GET`  | `/api/auth/me`                 | Данные текущего пользователя (требует Bearer)   |
-| `POST` | `/api/auth/logout`             | Выход (из cookie `refresh_token`)               |
+| Метод  | Эндпоинт                       | Auth   | Описание                                      |
+|--------|--------------------------------|--------|-----------------------------------------------|
+| `GET`  | `/api/auth/providers`          | --     | Список доступных провайдеров                  |
+| `POST` | `/api/auth/register`           | --     | Регистрация локального пользователя            |
+| `POST` | `/api/auth/login/local`        | --     | Логин (пароль). Cookie: `refresh_token`        |
+| `GET`  | `/api/auth/login/egisz`        | --     | Начать OIDC-поток (redirect)                   |
+| `GET`  | `/api/auth/callback/egisz`     | --     | OIDC callback. Cookie: `refresh_token`         |
+| `POST` | `/api/auth/refresh`            | Cookie | Обновить токены (из cookie `refresh_token`)    |
+| `GET`  | `/api/auth/me`                 | Bearer | Данные текущего пользователя                   |
+| `POST` | `/api/auth/logout`             | Cookie | Выход (из cookie `refresh_token`)              |
 
 ---
 
-## Пример интеграции
+## Примеры интеграции
 
-### C# (HttpClient)
+### JavaScript / TypeScript (SPA)
+
+```javascript
+const AUTH_BASE = 'https://auth-service.example.com';
+
+// 1. Перенаправить на логин ЕГИСЗ
+function loginEgisz(returnUrl) {
+  window.location.href =
+    `${AUTH_BASE}/api/auth/login/egisz?returnUrl=${encodeURIComponent(returnUrl)}`;
+}
+
+// 2. После callback получить accessToken из JSON-ответа браузера
+// (этот код выполняется на странице /callback/egisz)
+async function handleCallback() {
+  const response = await fetch(window.location.href);
+  const data = await response.json();
+  
+  // Сохранить в sessionStorage
+  sessionStorage.setItem('accessToken', data.accessToken);
+  sessionStorage.setItem('user', JSON.stringify(data.user));
+  
+  // Перенаправить на главную
+  window.location.href = '/dashboard';
+}
+
+// 3. Получить данные текущего пользователя
+async function getCurrentUser() {
+  const token = sessionStorage.getItem('accessToken');
+  
+  const res = await fetch(`${AUTH_BASE}/api/auth/me`, {
+    headers: { 'Authorization': `Bearer ${token}` }
+  });
+  
+  if (!res.ok) {
+    // Токен истёк, попробовать refresh
+    await refreshToken();
+    return getCurrentUser(); // повторить запрос
+  }
+  
+  return await res.json();
+}
+
+// 4. Обновить токен (refresh_token из cookie автоматически)
+async function refreshToken() {
+  const res = await fetch(`${AUTH_BASE}/api/auth/refresh`, {
+    method: 'POST',
+    credentials: 'include' // важно! отправляет cookie
+  });
+  
+  if (!res.ok) {
+    // Refresh token истёк, нужен новый login
+    window.location.href = `${AUTH_BASE}/api/auth/login/egisz`;
+    return;
+  }
+  
+  const data = await res.json();
+  sessionStorage.setItem('accessToken', data.accessToken);
+}
+
+// 5. Выход (refresh_token из cookie автоматически)
+async function logout() {
+  await fetch(`${AUTH_BASE}/api/auth/logout`, {
+    method: 'POST',
+    credentials: 'include' // важно! отправляет cookie
+  });
+  
+  sessionStorage.clear();
+  window.location.href = '/';
+}
+
+// 6. Защищённый API-запрос к вашему бэкенду
+async function callProtectedApi(endpoint) {
+  const token = sessionStorage.getItem('accessToken');
+  
+  const res = await fetch(`https://your-backend.com${endpoint}`, {
+    headers: { 'Authorization': `Bearer ${token}` }
+  });
+  
+  if (res.status === 401) {
+    // Токен истёк
+    await refreshToken();
+    return callProtectedApi(endpoint); // повторить
+  }
+  
+  return await res.json();
+}
+```
+
+---
+
+### C# (Backend-to-Backend)
+
+Если ваш backend должен вызывать API сервиса авторизации от имени пользователя:
 
 ```csharp
+using System.Net.Http.Headers;
+using System.Net.Http.Json;
+
 public class AuthServiceClient
 {
     private readonly HttpClient _http;
     private readonly string _authBaseUrl;
 
-    public AuthServiceClient(HttpClient http, string authBaseUrl)
+    public AuthServiceClient(HttpClient http, IConfiguration config)
     {
         _http = http;
-        _authBaseUrl = authBaseUrl.TrimEnd('/');
+        _authBaseUrl = config["AuthService:BaseUrl"]!.TrimEnd('/');
+        
+        // Важно: HttpClient должен поддерживать cookies
+        var handler = new HttpClientHandler
+        {
+            UseCookies = true,
+            CookieContainer = new System.Net.CookieContainer()
+        };
+        _http = new HttpClient(handler) { BaseAddress = new Uri(_authBaseUrl) };
     }
 
-    // Получить URL для редиректа пользователя на логин
-    public string GetLoginUrl(string returnUrl)
+    // Локальный логин (для тестирования)
+    public async Task<LoginResponse?> LoginLocalAsync(string username, string password)
     {
-        return $"{_authBaseUrl}/api/auth/login/egisz?returnUrl={Uri.EscapeDataString(returnUrl)}";
-    }
-
-    // Обновить токен (refresh_token читается из cookie)
-    public async Task<RefreshResult?> RefreshAsync()
-    {
-        var response = await _http.PostAsync(
-            $"{_authBaseUrl}/api/auth/refresh", null);
+        var response = await _http.PostAsJsonAsync("/api/auth/login/local", new
+        {
+            username,
+            password
+        });
+        
         if (!response.IsSuccessStatusCode)
             return null;
-        return await response.Content.ReadFromJsonAsync<RefreshResult>();
+        
+        return await response.Content.ReadFromJsonAsync<LoginResponse>();
     }
 
-    // Выход (refresh_token читается из cookie)
-    public async Task LogoutAsync()
-    {
-        await _http.PostAsync(
-            $"{_authBaseUrl}/api/auth/logout", null);
-    }
-
-    // Получить данные текущего пользователя (требует Bearer token)
+    // Получить данные пользователя (требует Bearer token)
     public async Task<UserInfo?> GetCurrentUserAsync(string accessToken)
     {
         _http.DefaultRequestHeaders.Authorization =
-            new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", accessToken);
-        var response = await _http.GetAsync($"{_authBaseUrl}/api/auth/me");
+            new AuthenticationHeaderValue("Bearer", accessToken);
+        
+        var response = await _http.GetAsync("/api/auth/me");
+        
         if (!response.IsSuccessStatusCode)
             return null;
+        
         return await response.Content.ReadFromJsonAsync<UserInfo>();
+    }
+
+    // Обновить токен (refresh_token из cookie автоматически)
+    public async Task<RefreshResponse?> RefreshAsync()
+    {
+        var response = await _http.PostAsync("/api/auth/refresh", null);
+        
+        if (!response.IsSuccessStatusCode)
+            return null;
+        
+        return await response.Content.ReadFromJsonAsync<RefreshResponse>();
+    }
+
+    // Выход (refresh_token из cookie автоматически)
+    public async Task LogoutAsync()
+    {
+        await _http.PostAsync("/api/auth/logout", null);
     }
 }
 
-public record UserInfo(string Sub, string? UserName, string? Email,
-    string? GivenName, string? FamilyName, string? MiddleName, string? AuthProvider);
-public record RefreshResult(string AccessToken, int ExpiresIn);
-```
+public record LoginResponse(
+    string AccessToken,
+    int ExpiresIn,
+    UserInfo User,
+    string AuthProvider);
 
-### JavaScript (fetch)
+public record UserInfo(
+    string Sub,
+    string? UserName,
+    string? Email,
+    string? GivenName,
+    string? FamilyName,
+    string? MiddleName,
+    string? AuthProvider);
 
-```javascript
-const AUTH_BASE = 'https://auth-service.example.com';
-
-// Перенаправить на логин ЕГИСЗ
-function login(returnUrl) {
-  window.location.href =
-    `${AUTH_BASE}/api/auth/login/egisz?returnUrl=${encodeURIComponent(returnUrl)}`;
-}
-
-// Получить данные текущего пользователя
-async function getCurrentUser(accessToken) {
-  const res = await fetch(`${AUTH_BASE}/api/auth/me`, {
-    headers: { 'Authorization': `Bearer ${accessToken}` }
-  });
-  if (!res.ok) return null;
-  return await res.json();
-}
-
-// Обновить токен (refresh_token читается из cookie автоматически)
-async function refresh() {
-  const res = await fetch(`${AUTH_BASE}/api/auth/refresh`, {
-    method: 'POST',
-    credentials: 'include' // важно для отправки cookie
-  });
-  if (!res.ok) return null;
-  return await res.json();
-}
-
-// Выход (refresh_token читается из cookie автоматически)
-async function logout() {
-  await fetch(`${AUTH_BASE}/api/auth/logout`, {
-    method: 'POST',
-    credentials: 'include' // важно для отправки cookie
-  });
-}
+public record RefreshResponse(
+    string AccessToken,
+    int ExpiresIn);
 ```
 
 ---
 
-## Типичный поток для web-приложения
+## Типичный поток для web-приложения (SPA)
 
 ```
-Пользователь          Ваш сервис            Сервис авторизации       ИА ЕГИСЗ
+Пользователь          Фронтенд (SPA)        Сервис авторизации       ИА ЕГИСЗ
      |                    |                        |                     |
      |  Нажимает "Войти"  |                        |                     |
      |------------------->|                        |                     |
-     |                    |  redirect /api/auth/login                    |
+     |                    |  redirect /login/egisz |                     |
      |                    |----------------------->|                     |
      |                    |                        |  redirect /auth     |
      |<----------------------------------------------------- ---------->|
@@ -321,20 +496,33 @@ async function logout() {
      |                    |                        |  redirect /callback |
      |                    |                        |<--------------------|
      |                    |  200 OK + JSON         |                     |
+     |                    |  + Cookie refresh_token|                     |
      |                    |<-----------------------|                     |
      |                    |                        |                     |
-     |                    |  Сохраняет sessionId   |                     |
+     |                    |  Сохраняет accessToken |                     |
+     |                    |  в sessionStorage      |                     |
      |  Авторизован       |                        |                     |
      |<-------------------|                        |                     |
      |                    |                        |                     |
-     |  Защищённый запрос |                        |                     |
+     |  Запрос к API      |                        |                     |
      |------------------->|                        |                     |
-     |                    |  GET /session/{id}     |                     |
+     |                    |  GET /me               |                     |
+     |                    |  Authorization: Bearer |                     |
      |                    |----------------------->|                     |
-     |                    |  200 OK (isActive:true)|                     |
+     |                    |  200 OK (user data)    |                     |
      |                    |<-----------------------|                     |
      |  Ответ             |                        |                     |
      |<-------------------|                        |                     |
+     |                    |                        |                     |
+     |  (через 30 мин)    |                        |                     |
+     |  401 Unauthorized  |                        |                     |
+     |<-------------------|                        |                     |
+     |                    |  POST /refresh         |                     |
+     |                    |  Cookie: refresh_token |                     |
+     |                    |----------------------->|                     |
+     |                    |  200 OK + new token    |                     |
+     |                    |<-----------------------|                     |
+     |                    |  Обновляет accessToken |                     |
 ```
 
 ---
@@ -345,7 +533,9 @@ async function logout() {
 |----------|-------------------------------------------------|-------------------------------------------|
 | `200`    | Успешный запрос                                 | Обработать ответ                          |
 | `400`    | Невалидные параметры                            | Проверить тело запроса                    |
-| `404`    | Сессия не найдена / неактивна                   | Перенаправить на `/api/auth/login`        |
+| `401`    | Access token истёк или невалиден                | Вызвать `POST /api/auth/refresh`          |
+| `401`    | Refresh token истёк или невалиден               | Перенаправить на `/api/auth/login/egisz`  |
+| `404`    | Пользователь не найден                          | Проверить данные                          |
 | `500`    | Ошибка связи с ИА ЕГИСЗ или внутренняя ошибка  | Повторить запрос / показать ошибку        |
 
 ---
@@ -353,17 +543,20 @@ async function logout() {
 ## SSO -- Single Sign-On
 
 Если пользователь уже авторизован в ИА ЕГИСЗ через другой сервис,
-при вызове `/api/auth/login` он **не увидит форму логина** --
+при вызове `/api/auth/login/egisz` он **не увидит форму логина** --
 ИА ЕГИСЗ автоматически выдаст код авторизации и перенаправит обратно.
 
 Для внешнего сервиса это прозрачно -- поток остаётся тем же.
 
+---
+
 ## SLO -- Single Logout
 
-При вызове `POST /api/auth/logout` или `GET /api/auth/logout/{id}`:
-1. Инвалидируются **все** сессии данного пользователя в сервисе авторизации.
-2. Отправляется запрос на завершение глобальной сессии в ИА ЕГИСЗ.
-3. Пользователь выходит из **всех** подключённых подсистем ЕГИСЗ.
+При вызове `POST /api/auth/logout`:
+1. Инвалидируются **все** сессии данного пользователя в Redis
+2. Cookie `refresh_token` удаляется
+3. Если пользователь авторизован через ЕГИСЗ, отправляется запрос на завершение глобальной сессии в ИА ЕГИСЗ
+4. Пользователь выходит из **всех** подключённых подсистем ЕГИСЗ
 
 ---
 
@@ -380,3 +573,13 @@ OpenAPI-спецификация:
 ```
 https://<auth-service-host>/openapi/v1.json
 ```
+
+### Использование кнопки Authorize
+
+1. Выполните login через Swagger UI (`POST /api/auth/login/local`)
+2. Скопируйте `accessToken` из ответа
+3. Нажмите кнопку **Authorize** (замок) в правом верхнем углу
+4. Вставьте токен в поле **Value** (без префикса "Bearer")
+5. Нажмите **Authorize**, затем **Close**
+
+Теперь все запросы будут автоматически отправлять `Authorization: Bearer <token>`.
